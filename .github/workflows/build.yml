@@ -95,13 +95,13 @@ jobs:
           ls ..
           find . -name '*.zip'
           mkdir -p artifacts
-          cp twister-out/thingy91x_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/merged.hex \
+          cp twister-out/thingy91x_nrf9151_ns/zephyr/serial_modem/app/serial_modem.modem_trace/merged.hex \
             artifacts/thingy91x_serial_modem_${VERSION}.hex
-          cp twister-out/thingy91x_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/dfu_application.zip \
+          cp twister-out/thingy91x_nrf9151_ns/zephyr/serial_modem/app/serial_modem.modem_trace/dfu_application.zip \
             artifacts/thingy91x_serial_modem_${VERSION}_dfu.zip
-          cp twister-out/nrf9151dk_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/merged.hex \
+          cp twister-out/nrf9151dk_nrf9151_ns/zephyr/serial_modem/app/serial_modem.modem_trace/merged.hex \
             artifacts/nrf9151dk_serial_modem_${VERSION}.hex
-          cp twister-out/nrf9151dk_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/dfu_application.zip \
+          cp twister-out/nrf9151dk_nrf9151_ns/zephyr/serial_modem/app/serial_modem.modem_trace/dfu_application.zip \
             artifacts/nrf9151dk_serial_modem_${VERSION}_dfu.zip
 
       - name: Store binaries as artifacts
