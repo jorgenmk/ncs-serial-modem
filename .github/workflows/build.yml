@@ -87,10 +87,9 @@ jobs:
 
       - name: Rename binaries
         if: ${{ inputs.trigger_source == 'release-workflow' }}
+        working-directory: serial_modem
         run: |
-          cd serial_modem
           VERSION=${{ github.event.release.tag_name || github.ref_name || 'unknown-version' }} 
-          cd ..
           mkdir -p artifacts
           cp twister-out/thingy91x_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/merged.hex \
             artifacts/thingy91x_serial_modem_${VERSION}.hex
