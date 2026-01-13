@@ -28,13 +28,13 @@ jobs:
 
         - name: Download artifact
           uses: actions/download-artifact@v4
-          with:
-           name: serial_modem_fw
-
+        - name: List files
+          run: ls -lR .
         - name: Deploy release to github
           uses: softprops/action-gh-release@v2
           with:
             fail_on_unmatched_files: true
             files: |
-              serial_modem-*
+                *.hex
+                *.zip
 
