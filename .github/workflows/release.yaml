@@ -16,9 +16,6 @@ jobs:
       contents: write
       pull-requests: write
     secrets: inherit
-    with:
-      memfault_fw_type: "att"
-      build_all: true
 
   attach-assets:
     runs-on: ubuntu-24.04
