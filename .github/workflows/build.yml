@@ -90,6 +90,10 @@ jobs:
         working-directory: serial_modem
         run: |
           VERSION=${{ github.event.release.tag_name || github.ref_name || 'unknown-version' }} 
+          ls -l
+          pwd
+          ls ..
+          find . -name '*.zip'
           mkdir -p artifacts
           cp twister-out/thingy91x_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/merged.hex \
             artifacts/thingy91x_serial_modem_${VERSION}.hex
