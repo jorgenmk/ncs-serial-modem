@@ -108,5 +108,5 @@ jobs:
         if: ${{ inputs.trigger_source == 'release-workflow' }}
         uses: actions/upload-artifact@v4
         with:
-          path: artifacts/*
+          path: serial_modem/artifacts/*
           name: serial_modem_fw
