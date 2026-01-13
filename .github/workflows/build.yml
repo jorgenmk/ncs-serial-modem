@@ -81,13 +81,15 @@ jobs:
       - name: Build serial modem release
         if: ${{ inputs.trigger_source == 'release-workflow' }}
         run: |
+          echo tag name: ${{ github.event.release.tag_name }}
+          echo ref: ${{ github.ref }}
           ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors -s serial_modem.modem_trace
 
       - name: Rename binaries
         if: ${{ inputs.trigger_source == 'release-workflow' }}
         run: |
           cd serial_modem
-          VERSION=$(git describe)
+          VERSION=${{ github.event.release.tag_name || github.ref_name || 'unknown-version' }} 
           cd ..
           mkdir -p artifacts
           cp twister-out/thingy91x_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/merged.hex \
