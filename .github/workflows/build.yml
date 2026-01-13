@@ -11,6 +11,12 @@ on:
     # Run every day at 03:00 AM
     - cron: "00 3 * * *"
   workflow_call:
+    inputs:
+      trigger_source:
+        description: 'Trigger source'
+        required: true
+        type: string
+
 
 jobs:
   build-and-test-in-toolchain-bundle:
@@ -68,11 +74,17 @@ jobs:
           ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors --integration
 
       - name: Build Serial Modem nightly
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_call'
+        if: github.event_name == 'schedule'
         run: |
           ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors --all
+
+      - name: Build serial modem release
+        if: ${{ inputs.trigger_source == 'release-workflow' }}
+        run: |
+          ./nrfutil toolchain-manager launch --chdir serial_modem -- west twister -T . -v --inline-logs --overflow-as-errors -s serial_modem.modem_trace
+
       - name: Rename binaries
-        if: github.event_name == 'workflow_call'
+        if: ${{ inputs.trigger_source == 'release-workflow' }}
         run: |
           cd serial_modem
           VERSION=$(git describe)
@@ -86,8 +98,9 @@ jobs:
             artifacts/nrf9151dk_serial_modem_${VERSION}.hex
           cp twister-out/nrf9151dk_nrf9151_ns/zephyr/ncs-serial-modem/app/serial_modem.modem_trace/dfu_application.zip \
             artifacts/nrf9151dk_serial_modem_${VERSION}_dfu.zip
+
       - name: Store binaries as artifacts
-        if: github.event_name == 'workflow_call'
+        if: ${{ inputs.trigger_source == 'release-workflow' }}
         uses: actions/upload-artifact@v4
         with:
           path: artifacts/*

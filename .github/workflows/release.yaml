@@ -17,8 +17,7 @@ jobs:
       pull-requests: write
     secrets: inherit
     with:
-      memfault_fw_type: "att"
-      build_all: true
+      trigger_source: 'release-workflow'
 
   attach-assets:
     runs-on: ubuntu-24.04
