@@ -23,13 +23,9 @@ jobs:
     runs-on: ubuntu-24.04
     needs: [build]
     steps:
-        - name: Checkout
-          uses: actions/checkout@v4
-
         - name: Download artifact
           uses: actions/download-artifact@v4
-        - name: List files
-          run: ls -lR .
+
         - name: Deploy release to github
           uses: softprops/action-gh-release@v2
           with:
