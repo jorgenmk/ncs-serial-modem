@@ -109,4 +109,3 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           path: serial_modem/artifacts/*
-          name: serial_modem_fw
