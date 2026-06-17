@@ -1,0 +1,198 @@
+name: Secure boot demo
+
+# One-run demo of the split build/sign flow and NSIB key trust/revocation:
+# build the unsigned images once, then matrix-sign three variants in the same
+# run. All signed artifacts are produced together for flashing on a device.
+#
+#   good         trusted keys (transit/), MCUboot signed by nsib_0.
+#                Flash FIRST on a fresh device: provisions UICR with the trusted
+#                key hashes (nsib_0..3) and boots.
+#   bad-keys     untrusted keys (transit-bad/), signed by a different nsib_0.
+#                Flash on the good-provisioned device (no chip-erase): B0 rejects
+#                it - not signed by a trusted key - so it will not boot.
+#   revoke-key0  trusted keys (transit/), MCUboot signed by nsib_1. Booting this
+#                makes B0 revoke nsib_0; afterwards the "good" build (nsib_0) is
+#                also rejected.
+#
+# Requires repository secrets VAULT_ADDR / VAULT_TOKEN, with keys provisioned on
+# both the transit/ and transit-bad/ mounts (scripts/signing/01-vault-setup.sh,
+# the latter with VAULT_TRANSIT_MOUNT=transit-bad).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-unsigned:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Serial Modem repository
+        uses: actions/checkout@v4
+        with:
+          path: serial_modem
+
+      - name: Prepare west project
+        run: |
+          python3 -m pip install west
+          west init -l serial_modem
+          west update -o=--depth=1 -n
+
+      - name: Install nrfutil and toolchain manager
+        run: |
+          wget -q https://files.nordicsemi.com/artifactory/swtools/external/nrfutil/executables/x86_64-unknown-linux-gnu/nrfutil
+          chmod +x nrfutil
+          ./nrfutil install toolchain-manager
+
+      - name: Find proper toolchain bundle
+        id: set-tb-id
+        run: echo "TOOLCHAIN_BUNDLE_NAME=ncs-toolchain-x86_64-linux-$(./nrf/scripts/print_toolchain_checksum.sh).tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Restore toolchain bundle from cache
+        id: restore-cached-tb
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+          key: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Download toolchain bundle if not cached
+        if: steps.restore-cached-tb.outputs.cache-hit != 'true'
+        run: wget https://files.nordicsemi.com/artifactory/NCS/external/bundles/v3/${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Save toolchain bundle to cache
+        if: steps.restore-cached-tb.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+          key: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Install proper toolchain bundle
+        run: ./nrfutil toolchain-manager install --toolchain-bundle ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Fetch MCUboot public key from Vault (trusted)
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          if [ -z "${VAULT_ADDR}" ] || [ -z "${VAULT_TOKEN}" ]; then
+            echo "::error::Set the VAULT_ADDR and VAULT_TOKEN repository secrets."; exit 1
+          fi
+          mkdir -p serial_modem/app/signing-keys
+          curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR%/}/v1/transit/keys/mcuboot" \
+            | jq -r '.data.keys | to_entries | max_by(.key|tonumber) | .value.public_key' \
+            > serial_modem/app/signing-keys/mcuboot_pub.pem
+          grep -q "BEGIN PUBLIC KEY" serial_modem/app/signing-keys/mcuboot_pub.pem || {
+            echo "::error::Could not fetch the 'mcuboot' public key from Vault."; exit 1; }
+
+      - name: Build unsigned artifacts
+        run: |
+          ./nrfutil toolchain-manager launch --chdir serial_modem/app -- \
+            env PYTHON=python3 ./scripts/signing/build-unsigned.sh
+
+      - name: Upload unsigned artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-bundle
+          path: serial_modem/app/signing-out/unsigned/
+          if-no-files-found: error
+
+  sign:
+    needs: build-unsigned
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: good
+            mount: transit
+            nsib_index: "0"
+          - variant: bad-keys
+            mount: transit-bad
+            nsib_index: "0"
+          - variant: revoke-key0
+            mount: transit
+            nsib_index: "1"
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+      VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+      VAULT_TRANSIT_MOUNT: ${{ matrix.mount }}
+    steps:
+      - name: Download signing scripts and manifest from this repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.sha }}
+        run: |
+          dl() {
+            curl -sfL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${REPO}/contents/$1?ref=${REF}" -o "$2"
+          }
+          mkdir -p scripts/signing
+          for s in common.sh sign-release.sh package-app-fota.sh vault-sign-nsib.sh mergehex_min.py; do
+            dl "app/scripts/signing/${s}" "scripts/signing/${s}"
+          done
+          chmod +x scripts/signing/*.sh
+
+      - name: Download unsigned bundle from the build job
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-bundle
+          path: signing-out/unsigned
+
+      - name: Install signing dependencies
+        run: |
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q --upgrade pip
+          /tmp/venv/bin/pip install -q imgtool intelhex cryptography pyyaml
+          wget -qO- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com noble main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq vault
+
+      - name: Fetch NCS signing helper scripts (pinned to the unsigned bundle's NCS revision)
+        run: |
+          . signing-out/unsigned/manifest.env 2>/dev/null || true
+          NRF_REV="${NCS_REVISION:-}"
+          if [ -z "${NRF_REV}" ]; then
+            # Fallback: read sdk-nrf revision from this repo's manifest.
+            curl -sfL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${{ github.repository }}/contents/west.yml?ref=${{ github.sha }}" -o west.yml
+            NRF_REV=$(/tmp/venv/bin/python3 -c "import yaml; m=yaml.safe_load(open('west.yml'))['manifest']; print(next(p['revision'] for p in m['projects'] if p.get('repo-path')=='sdk-nrf' or p.get('name')=='nrf'))")
+          fi
+          echo "Using sdk-nrf revision ${NRF_REV}"
+          mkdir -p /tmp/ncs-scripts
+          base="https://raw.githubusercontent.com/nrfconnect/sdk-nrf/${NRF_REV}/scripts/bootloader"
+          for s in hash.py validation_data.py provision.py generate_zip.py; do
+            curl -sfL "${base}/${s}" -o "/tmp/ncs-scripts/${s}"
+          done
+
+      - name: Fetch public verification keys from Vault (${{ matrix.mount }})
+        run: |
+          mkdir -p signing-keys
+          for k in nsib_0 nsib_1 nsib_2 nsib_3 mcuboot; do
+            curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR%/}/v1/${VAULT_TRANSIT_MOUNT}/keys/${k}" \
+              | jq -r '.data.keys | to_entries | max_by(.key|tonumber) | .value.public_key' \
+              > "signing-keys/${k}_pub.pem"
+            grep -q "BEGIN PUBLIC KEY" "signing-keys/${k}_pub.pem" || {
+              echo "::error::Could not fetch '${k}' from ${VAULT_TRANSIT_MOUNT}. Provision it (01-vault-setup.sh, VAULT_TRANSIT_MOUNT=${VAULT_TRANSIT_MOUNT})."; exit 1; }
+          done
+
+      - name: Sign '${{ matrix.variant }}' with Vault
+        env:
+          PYTHON: /tmp/venv/bin/python3
+          IMGTOOL: /tmp/venv/bin/imgtool
+          HASH_PY: /tmp/ncs-scripts/hash.py
+          VALIDATION_DATA_PY: /tmp/ncs-scripts/validation_data.py
+          PROVISION_PY: /tmp/ncs-scripts/provision.py
+          GENERATE_ZIP_PY: /tmp/ncs-scripts/generate_zip.py
+          MERGEHEX: ${{ github.workspace }}/scripts/signing/mergehex_min.py
+        run: |
+          ./scripts/signing/sign-release.sh --nsib-sign-index ${{ matrix.nsib_index }}
+          ./scripts/signing/package-app-fota.sh
+
+      - name: Upload signed artifacts (${{ matrix.variant }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-${{ matrix.variant }}
+          path: |
+            signing-out/release/
+            signing-out/fota/
+          if-no-files-found: error

@@ -1,0 +1,96 @@
+name: Build unsigned artifacts
+
+# Demo workflow for the split build/sign flow: build the UNSIGNED b0 / MCUboot /
+# app artifacts and publish them as a build artifact. Only the MCUboot PUBLIC
+# verification key is read from Vault (via the VAULT_ADDR/VAULT_TOKEN secrets) to
+# bake into MCUboot; no private key is present. A secure environment signs the
+# bundle later with Vault (scripts/signing/sign-release.sh).
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - vault-signing-workflow
+
+jobs:
+  build-unsigned:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout Serial Modem repository
+        uses: actions/checkout@v4
+        with:
+          path: serial_modem
+
+      - name: Prepare west project
+        run: |
+          python3 -m pip install west
+          west init -l serial_modem
+          west update -o=--depth=1 -n
+
+      - name: Install nrfutil and toolchain manager
+        run: |
+          wget -q https://files.nordicsemi.com/artifactory/swtools/external/nrfutil/executables/x86_64-unknown-linux-gnu/nrfutil
+          chmod +x nrfutil
+          ./nrfutil install toolchain-manager
+
+      - name: Find proper toolchain bundle
+        id: set-tb-id
+        run: echo "TOOLCHAIN_BUNDLE_NAME=ncs-toolchain-x86_64-linux-$(./nrf/scripts/print_toolchain_checksum.sh).tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Restore toolchain bundle from cache
+        id: restore-cached-tb
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+          key: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Download toolchain bundle if not cached
+        if: steps.restore-cached-tb.outputs.cache-hit != 'true'
+        run: wget https://files.nordicsemi.com/artifactory/NCS/external/bundles/v3/${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Save toolchain bundle to cache
+        if: steps.restore-cached-tb.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+          key: ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Install proper toolchain bundle
+        run: ./nrfutil toolchain-manager install --toolchain-bundle ${{steps.set-tb-id.outputs.TOOLCHAIN_BUNDLE_NAME}}
+
+      - name: Fetch MCUboot public key from Vault
+        # The build only needs the PUBLIC verification key to bake into MCUboot.
+        # Fetch it read-only from Vault using the secrets. Keys must already be
+        # provisioned (scripts/signing/01-vault-setup.sh with the same VAULT env).
+        # curl and jq are preinstalled on the runner.
+        env:
+          VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+          VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+        run: |
+          if [ -z "${VAULT_ADDR}" ] || [ -z "${VAULT_TOKEN}" ]; then
+            echo "::error::Set the VAULT_ADDR and VAULT_TOKEN repository secrets."; exit 1
+          fi
+          mkdir -p serial_modem/app/signing-keys
+          curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" \
+            "${VAULT_ADDR%/}/v1/transit/keys/mcuboot" \
+            | jq -r '.data.keys | to_entries | max_by(.key|tonumber) | .value.public_key' \
+            > serial_modem/app/signing-keys/mcuboot_pub.pem
+          grep -q "BEGIN PUBLIC KEY" serial_modem/app/signing-keys/mcuboot_pub.pem || {
+            echo "::error::Could not fetch the 'mcuboot' public key from Vault. Provision keys first with scripts/signing/01-vault-setup.sh"; exit 1; }
+          echo "Fetched MCUboot public verification key from Vault."
+
+      - name: Build unsigned artifacts
+        # Runs west build inside the NCS toolchain environment. build-unsigned.sh
+        # bakes the public key into MCUboot, builds everything, and harvests the
+        # unsigned bundle (b0 / mcuboot S0+S1 / app) plus a signing manifest.
+        # PYTHON=python3 overrides common.sh's local default for the CI toolchain.
+        run: |
+          ./nrfutil toolchain-manager launch --chdir serial_modem/app -- \
+            env PYTHON=python3 ./scripts/signing/build-unsigned.sh
+
+      - name: Upload unsigned artifact bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-bundle
+          path: serial_modem/app/signing-out/unsigned/
+          if-no-files-found: error

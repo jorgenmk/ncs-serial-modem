@@ -1,0 +1,116 @@
+name: Sign release
+
+# Signing stage of the split build/sign demo. Takes the unsigned bundle produced
+# by "Build unsigned artifacts", signs every layer with keys held in Vault, and
+# publishes the signed images + dfu_application.zip.
+#
+# Deliberately lightweight: a plain ubuntu-24.04 runner with only a Python venv
+# (imgtool + a few pip deps), the Vault CLI, and a handful of helper scripts
+# fetched individually from this repo and sdk-nrf - no checkout of the full repo,
+# no toolchain, no NCS workspace, no compiler.
+#
+# Requires repository secrets: VAULT_ADDR, VAULT_TOKEN (keys provisioned via
+# scripts/signing/01-vault-setup.sh).
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: "Run ID of the 'Build unsigned artifacts' run to sign"
+        required: true
+  workflow_run:
+    workflows: ["Build unsigned artifacts"]
+    types: [completed]
+
+jobs:
+  sign:
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+      VAULT_TOKEN: ${{ secrets.VAULT_TOKEN }}
+    steps:
+      - name: Download signing scripts and manifest from this repo
+        # Fetch only the files the signing stage needs (no full-repo checkout).
+        # Uses the contents API so it works for private repos too.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.sha }}
+        run: |
+          dl() {  # dl <repo-path> <dest>
+            curl -sfL -H "Authorization: Bearer ${GH_TOKEN}" \
+                 -H "Accept: application/vnd.github.raw" \
+                 "https://api.github.com/repos/${REPO}/contents/$1?ref=${REF}" -o "$2"
+          }
+          mkdir -p scripts/signing
+          dl west.yml west.yml
+          for s in common.sh sign-release.sh package-app-fota.sh vault-sign-nsib.sh mergehex_min.py; do
+            dl "app/scripts/signing/${s}" "scripts/signing/${s}"
+          done
+          chmod +x scripts/signing/*.sh
+
+      - name: Download unsigned bundle from the build stage
+        uses: actions/download-artifact@v4
+        with:
+          name: unsigned-bundle
+          path: signing-out/unsigned
+          run-id: ${{ github.event.workflow_run.id || inputs.build_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install signing dependencies
+        run: |
+          # Python tooling in a venv (PEP 668: system Python is externally managed).
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/pip install -q --upgrade pip
+          /tmp/venv/bin/pip install -q imgtool intelhex cryptography pyyaml
+          # Vault CLI (HashiCorp build is API-compatible with the OpenBao server).
+          wget -qO- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp.gpg
+          echo "deb [signed-by=/usr/share/keyrings/hashicorp.gpg] https://apt.releases.hashicorp.com noble main" \
+            | sudo tee /etc/apt/sources.list.d/hashicorp.list >/dev/null
+          sudo apt-get update -qq && sudo apt-get install -y -qq vault
+
+      - name: Fetch NCS signing helper scripts (pinned to the build's sdk-nrf revision)
+        run: |
+          NRF_REV=$(/tmp/venv/bin/python3 -c "import yaml; m=yaml.safe_load(open('west.yml'))['manifest']; print(next(p['revision'] for p in m['projects'] if p.get('repo-path')=='sdk-nrf' or p.get('name')=='nrf'))")
+          echo "Using sdk-nrf revision ${NRF_REV}"
+          mkdir -p /tmp/ncs-scripts
+          base="https://raw.githubusercontent.com/nrfconnect/sdk-nrf/${NRF_REV}/scripts/bootloader"
+          for s in hash.py validation_data.py provision.py generate_zip.py; do
+            curl -sfL "${base}/${s}" -o "/tmp/ncs-scripts/${s}"
+          done
+          # mergehex comes from scripts/signing/mergehex_min.py (fetched above).
+
+      - name: Fetch public verification keys from Vault
+        run: |
+          mkdir -p signing-keys
+          for k in nsib_0 nsib_1 nsib_2 nsib_3 mcuboot; do
+            curl -sf -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR%/}/v1/transit/keys/${k}" \
+              | jq -r '.data.keys | to_entries | max_by(.key|tonumber) | .value.public_key' \
+              > "signing-keys/${k}_pub.pem"
+            grep -q "BEGIN PUBLIC KEY" "signing-keys/${k}_pub.pem" || {
+              echo "::error::Could not fetch '${k}' public key from Vault. Provision keys with scripts/signing/01-vault-setup.sh"; exit 1; }
+          done
+          echo "Fetched 5 public keys from Vault."
+
+      - name: Sign release with Vault
+        env:
+          PYTHON: /tmp/venv/bin/python3
+          IMGTOOL: /tmp/venv/bin/imgtool
+          HASH_PY: /tmp/ncs-scripts/hash.py
+          VALIDATION_DATA_PY: /tmp/ncs-scripts/validation_data.py
+          PROVISION_PY: /tmp/ncs-scripts/provision.py
+          GENERATE_ZIP_PY: /tmp/ncs-scripts/generate_zip.py
+          MERGEHEX: ${{ github.workspace }}/scripts/signing/mergehex_min.py
+        run: |
+          ./scripts/signing/sign-release.sh
+          ./scripts/signing/package-app-fota.sh
+
+      - name: Upload signed artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release
+          path: |
+            signing-out/release/
+            signing-out/fota/
+          if-no-files-found: error

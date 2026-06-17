@@ -1,0 +1,5 @@
+# Vault-backed signing workflow (scripts/signing/) - never commit keys/outputs
+/signing-keys/
+/signing-out/
+/build-mcuboot/
+/unsigned-build/
